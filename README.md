@@ -168,6 +168,213 @@ case encodableParameterFailure
 ```
 Thrown when `NetworkTask.requestParameterEncodable` fails to encode the given encodable in to request parameters.
 
+# Writing Testable APIs
+
+Once you have declared `NetworkRepo` which conforms to `TargetType` and `NetworkRequestable`.
+
+Follow below steps to make your APIs testable
+1. Use constructor injection to provide the network repo to you **ViewModel** instead of declaring a member inside the **ViewModel**
+2. Always pass your `NetowrkRepo` into your ViewModels instead of concrete implementations such as `APITarget`
+3. Declare your mock implementations of `NetworkRepo`
+4. Inject mock implementation of `NetworkRepo` in to your SUT (system under test, here ViewModel)
+5. Write the test cases to for the expected behaviour of the SUT
+
+Let's walk through an example:
+
+### ViewModel Declaration
+```swift
+class MyViewModel {
+
+    // MARK: Private variables
+    private let networkRepo: NetworkRepo.Type
+    private var apiCalls = [NetworkRequest]()
+    private var pageNumber = 0
+    
+    // MARK: Dynamic vars
+    let userLists: Dynamic<[UserData]> = Dynamic([])
+    let error: Dynamic<CustomError?> = Dynamic(nil)
+    let showLoading: Dynamic<Bool> = Dynamic(false)
+
+    // MARK: Initialization
+    init(networkRepo: NetworkRepo.Type) {
+        self.networkRepo = networkRepo
+    }
+    
+    /// Get new page
+    func getNewPage() {
+        pageNumber += 1
+        let requestURLParameters = UserListRequest(results: 10, page: pageNumber)
+        let usersListCall = networkRepo.fetchUsers(userListRequest: requestURLParameters)
+        showLoading.value = true
+        let request = usersListCall.request(type: UserListResponse.self) { [weak self] result in
+            self?.showLoading.value = false
+            switch result {
+            case .success(let userResponse):
+                self?.userLists.value = userResponse.results
+            case .failure(let error):
+                self?.error.value = error
+            }
+        }
+        apiCalls.append(request)
+    }
+
+    deinit {
+        // Cancel the API calls if the view model is de-initialized
+        apiCalls.cancel()
+    }
+}
+```
+
+### NetworkRepo Protocol
+Your `NetworkRepo` contains a call to fetch user list
+```swift
+protocol NetworkRepo: TargetType & NetworkRequestable {
+    static func fetchUsers(userListRequest: UserListRequest) -> Self
+}
+```
+
+### Mock Implementation
+Then you can create a `MockAPITarget` using this network repo same as you created the `APITarget`
+```swift
+public enum MockAPITarget: NetworkRepo {
+    case fetchUsers(userListRequest: UserListRequest)
+}
+```
+```swift
+extension MockAPITarget {
+    Define path, method, task, keyDecodingStrategy, headers for mocks
+}
+```
+```swift
+extension MockAPITarget {
+    
+    static var apiCallDelay = 4 // milliseconds
+    static var errorToThrow: CustomError?
+
+    public func request<T: Decodable>(type: T.Type,
+                                      callback: @escaping (Result<T, CustomError>) -> Void) -> NetworkRequest {
+        self.sendMockResponse(callback)
+        return MockNetworkRequest()
+    }
+
+    // swift_lint: cyclomatic_complexity
+    private func sendMockResponse<T: Decodable>(_ callback: @escaping (Result<T, CustomError>) -> Void) {
+        let asyncAfter: DispatchTime = .now() + DispatchTimeInterval.milliseconds(MockAPITarget.apiCallDelay)
+        DispatchQueue.global().asyncAfter(deadline: asyncAfter) {
+            if let errorToThrow = MockAPITarget.errorToThrow {
+                callback(.failure(errorToThrow))
+                return
+            }
+            switch self {
+            case .fetchUsers:
+                if let response = T.parse(jsonFile: "UserListResponse") {
+                    callback(.success(response))
+                    return
+                }
+            }
+            callback(.failure(.genericError))
+        }
+    }
+}
+```
+Where custom error is defined as below
+```swift
+struct CustomError: Error, Equatable {
+    let title: String
+    let body: String
+
+    /// No internet error object
+    static let noInternetError = CustomError(title: AppStrings.noInternetConnection(),
+                                             body: AppStrings.pleaseConnectToInternet())
+
+    /// Generic error object
+    static let genericError = CustomError(title: AppStrings.genericError(),
+                                          body: AppStrings.somethingWentWrong())
+}
+```
+Where `MockNetworkRequest` is simple conformance to `NetworkRequest`
+```swift
+class MockNetworkRequest: NetworkRequest {
+    
+    var isCancelled: Bool = false
+    
+    func cancel() {
+        if isCancelled { return }
+        isCancelled = true
+    }
+}
+```
+The `parse` method on `Decodable` is declared as below
+```swift
+extension Decodable {
+    
+  static func parse(jsonFile: String) -> Self? {
+    guard let url = Bundle.main.url(forResource: jsonFile, withExtension: "json"),
+          let data = try? Data(contentsOf: url),
+          let output = try? JSONDecoder().decode(self, from: data)
+        else {
+      return nil
+    }
+    return output
+  }
+}
+```
+
+### Writing Tests
+Now, when writing test cases, just pass your mock implementation of NetworkRepo to your ViewModel
+```swift
+final class MyViewModelTests: XCTestCase {
+    
+    var sut: MyViewModel!
+    
+    override func setUpWithError() throws {
+        sut = MyViewModel(networkRepo: MockAPITarget.self)
+    }
+
+    override func tearDownWithError() throws {
+        sut = nil
+        MockAPITarget.errorToThrow = nil
+    }
+
+    func testUserListAPISuccess() {
+        // Given
+        MockAPITarget.errorToThrow = nil
+
+        sut.userLists.bind { users in
+            // Then
+            XCTAssert(!users.isEmpty)
+            XCTAssert(users.count == 10)
+        }
+        sut.error.bind { error in
+            // Then
+            XCTAssertNil(error)
+        }
+
+        // When
+        sut.getNewPage()
+    }
+
+    func testUserListAPIFailure() {
+        // Given
+        let errorToThrow = CustomError.noInternetError
+        MockAPITarget.errorToThrow = errorToThrow
+
+        sut.userLists.bind { users in
+            // Then
+            XCTAssert(false)
+        }
+        sut.error.bind { error in
+            // Then
+            XCTAssertNotNil(error)
+            XCTAssert(error == errorToThrow)
+        }
+
+        // When
+        sut.getNewPage()
+    }
+}
+```
+
 ## License
 
 ```
